@@ -1,8 +1,9 @@
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
-test('renders learn react link', () => {
+test('renders article URL input and analyze button', () => {
   render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeInTheDocument();
+
+  expect(screen.getByPlaceholderText(/enter article url/i)).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /analyze/i })).toBeDisabled();
 });
