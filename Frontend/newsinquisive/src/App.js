@@ -1,7 +1,16 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import axios from "axios";
+import "./App.css";
 
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "";
+
+const fallbackSites = [
+  { name: "Times of India", url: "https://timesofindia.indiatimes.com/" },
+  { name: "News18", url: "https://www.news18.com/" },
+  { name: "Economic Times", url: "https://economictimes.indiatimes.com/" },
+  { name: "India.com", url: "https://www.india.com/" },
+  { name: "Republic World", url: "https://www.republicworld.com/" }
+];
 
 function getErrorMessage(error) {
   if (error.response?.data?.error) {
@@ -15,25 +24,43 @@ function getErrorMessage(error) {
   return error.message || "Something went wrong. Please try again.";
 }
 
+function speakText(text) {
+  if (!window.speechSynthesis || !text) {
+    return;
+  }
+
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.rate = 0.95;
+  window.speechSynthesis.speak(utterance);
+}
+
 function App() {
   const [url, setUrl] = useState("");
   const [article, setArticle] = useState(null);
   const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
+  const [answer, setAnswer] = useState(null);
   const [error, setError] = useState("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
+  const [newsSites, setNewsSites] = useState(fallbackSites);
 
-  const analyzeArticle = async () => {
+  useEffect(() => {
+    axios
+      .get(`${API_BASE_URL}/news-sites`)
+      .then((res) => setNewsSites(res.data.sites || fallbackSites))
+      .catch(() => setNewsSites(fallbackSites));
+  }, []);
+
+  const analyzeArticle = async (event) => {
+    event?.preventDefault();
     setError("");
-    setAnswer("");
+    setAnswer(null);
     setArticle(null);
     setIsAnalyzing(true);
 
     try {
-      const res = await axios.post(`${API_BASE_URL}/analyze`, {
-        url: url
-      });
+      const res = await axios.post(`${API_BASE_URL}/analyze`, { url });
       setArticle(res.data);
     } catch (err) {
       setError(getErrorMessage(err));
@@ -42,22 +69,23 @@ function App() {
     }
   };
 
-  const askQuestion = async () => {
+  const askQuestion = async (event) => {
+    event?.preventDefault();
     if (!article?.text) {
       setError("Analyze an article before asking a question.");
       return;
     }
 
     setError("");
-    setAnswer("");
+    setAnswer(null);
     setIsAsking(true);
 
     try {
       const res = await axios.post(`${API_BASE_URL}/question`, {
-        question: question,
+        question,
         context: article.text
       });
-      setAnswer(res.data.answer);
+      setAnswer(res.data);
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -66,43 +94,145 @@ function App() {
   };
 
   return (
-    <div style={{ padding: "20px" }}>
-      <h1>NewsInquisive</h1>
+    <main className="app-shell">
+      <section className="hero-card">
+        <div className="hero-copy">
+          <span className="eyebrow">AI news reader</span>
+          <h1>NewsInquisive</h1>
+          <p>
+            Paste any article link to extract the story, create a cleaner factual summary,
+            and ask questions that are answered from the article text.
+          </p>
+        </div>
+        <div className="hero-stats" aria-label="Application features">
+          <div>
+            <strong>3</strong>
+            <span>Core tools</span>
+          </div>
+          <div>
+            <strong>AI</strong>
+            <span>Summary + Q&A</span>
+          </div>
+        </div>
+      </section>
 
-      <input
-        placeholder="Enter article URL"
-        value={url}
-        onChange={(e) => setUrl(e.target.value)}
-      />
-      <button onClick={analyzeArticle} disabled={isAnalyzing || !url.trim()}>
-        {isAnalyzing ? "Analyzing..." : "Analyze"}
-      </button>
+      <section className="layout-grid">
+        <aside className="sidebar-card">
+          <h2>Popular news websites</h2>
+          <p>Use these as starting points, then paste a full article URL.</p>
+          <div className="site-list">
+            {newsSites.map((site) => (
+              <button
+                className="site-pill"
+                key={site.url}
+                type="button"
+                onClick={() => setUrl(site.url)}
+              >
+                <span>{site.name}</span>
+                <small>{site.url.replace(/^https?:\/\//, "")}</small>
+              </button>
+            ))}
+          </div>
+        </aside>
 
-      {error && (
-        <p role="alert" style={{ color: "crimson" }}>
-          {error}
-        </p>
-      )}
+        <div className="content-stack">
+          <form className="search-card" onSubmit={analyzeArticle}>
+            <label htmlFor="article-url">Article URL</label>
+            <div className="input-row">
+              <input
+                id="article-url"
+                placeholder="Enter article URL"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+              />
+              <button className="primary-button" type="submit" disabled={isAnalyzing || !url.trim()}>
+                {isAnalyzing ? "Analyzing..." : "Analyze"}
+              </button>
+            </div>
+            <p className="hint">Tip: Direct article pages produce better summaries than home pages.</p>
+          </form>
 
-      {article && (
-        <>
-          <h2>{article.title}</h2>
-          <h3>Summary</h3>
-          <p>{article.summary}</p>
+          {error && (
+            <div className="alert" role="alert">
+              {error}
+            </div>
+          )}
 
-          <input
-            placeholder="Ask a question"
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-          />
-          <button onClick={askQuestion} disabled={isAsking || !question.trim()}>
-            {isAsking ? "Getting answer..." : "Get Answer"}
-          </button>
+          {isAnalyzing && (
+            <section className="result-card skeleton-card" aria-live="polite">
+              <div className="spinner" />
+              <div>
+                <h2>Reading the article...</h2>
+                <p>Extracting text and generating a summary. The first run may take longer while AI models load.</p>
+              </div>
+            </section>
+          )}
 
-          {answer && <h4>Answer: {answer}</h4>}
-        </>
-      )}
-    </div>
+          {article && (
+            <section className="result-card">
+              <div className="article-header">
+                <span className="tag">Analyzed article</span>
+                <h2>{article.title}</h2>
+                <div className="metadata">
+                  <span>{article.wordCount} words</span>
+                  <a href={article.sourceUrl} target="_blank" rel="noreferrer">
+                    Open source
+                  </a>
+                </div>
+              </div>
+
+              <div className="summary-box">
+                <div className="section-title-row">
+                  <h3>Summary</h3>
+                  <button className="ghost-button" type="button" onClick={() => speakText(article.summary)}>
+                    Speak summary
+                  </button>
+                </div>
+                <p>{article.summary}</p>
+              </div>
+
+              <details className="article-details">
+                <summary>Show extracted article text</summary>
+                <p>{article.text}</p>
+              </details>
+
+              <form className="qa-card" onSubmit={askQuestion}>
+                <label htmlFor="question">Ask a question about this article</label>
+                <div className="input-row">
+                  <input
+                    id="question"
+                    placeholder="Example: Which party is discussed in the article?"
+                    value={question}
+                    onChange={(e) => setQuestion(e.target.value)}
+                  />
+                  <button className="primary-button" type="submit" disabled={isAsking || !question.trim()}>
+                    {isAsking ? "Getting answer..." : "Get Answer"}
+                  </button>
+                </div>
+              </form>
+
+              {answer && (
+                <div className="answer-card">
+                  <div className="section-title-row">
+                    <h3>Answer</h3>
+                    <button className="ghost-button" type="button" onClick={() => speakText(answer.answer)}>
+                      Speak answer
+                    </button>
+                  </div>
+                  <p className="answer-text">{answer.answer}</p>
+                  <p className="confidence">Confidence: {Math.round((answer.confidence || 0) * 100)}%</p>
+                  {answer.source && (
+                    <blockquote>
+                      <strong>Evidence:</strong> {answer.source}
+                    </blockquote>
+                  )}
+                </div>
+              )}
+            </section>
+          )}
+        </div>
+      </section>
+    </main>
   );
 }
 
