@@ -3,6 +3,8 @@ import os
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import re
+import traceback
+from collections import Counter
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -13,7 +15,7 @@ from newspaper import Article, Config
 app = Flask(__name__)
 CORS(app)
 
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "sshleifer/distilbart-cnn-12-6")
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "t5-small")
 QA_MODEL = os.getenv("QA_MODEL", "deepset/roberta-base-squad2")
 MIN_ANSWER_SCORE = float(os.getenv("MIN_ANSWER_SCORE", "0.08"))
 MAX_SUMMARY_INPUT_CHARS = int(os.getenv("MAX_SUMMARY_INPUT_CHARS", "3500"))
@@ -26,6 +28,14 @@ NEWS_SITES = [
     {"name": "India.com", "url": "https://www.india.com/"},
     {"name": "Republic World", "url": "https://www.republicworld.com/"},
 ]
+
+STOP_WORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "on",
+    "for", "and", "or", "about", "which", "what", "who", "when", "where", "why",
+    "how", "does", "do", "did", "this", "that", "article", "news", "with", "from",
+    "by", "as", "at", "it", "its", "be", "has", "have", "had", "will", "would",
+    "can", "could", "should", "may", "might", "than", "then", "there", "their",
+}
 
 
 def clean_text(text):
@@ -65,16 +75,16 @@ def chunk_text(text, max_chars):
     return chunks or ([text[:max_chars]] if text else [])
 
 
+def important_words(text):
+    return [
+        word for word in re.findall(r"[a-zA-Z0-9]+", text.lower())
+        if len(word) > 2 and word not in STOP_WORDS
+    ]
+
+
 def keyword_overlap_score(question, chunk):
-    stop_words = {
-        "the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "on",
-        "for", "and", "or", "about", "which", "what", "who", "when", "where", "why",
-        "how", "does", "do", "did", "this", "that", "article", "news",
-    }
-    question_terms = {
-        word for word in re.findall(r"[a-zA-Z0-9]+", question.lower()) if word not in stop_words
-    }
-    chunk_terms = set(re.findall(r"[a-zA-Z0-9]+", chunk.lower()))
+    question_terms = set(important_words(question))
+    chunk_terms = set(important_words(chunk))
     return len(question_terms & chunk_terms)
 
 
@@ -85,10 +95,9 @@ def get_summarizer():
 
         return pipeline("summarization", model=SUMMARY_MODEL)
     except Exception as exc:
-        raise RuntimeError(
-            "Could not load the summarization model. The first run downloads AI model "
-            "files and can take several minutes. Check your internet connection, then retry."
-        ) from exc
+        print("WARNING: summarization model load failed; using extractive fallback.")
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        return None
 
 
 @lru_cache(maxsize=1)
@@ -98,10 +107,9 @@ def get_question_answerer():
 
         return pipeline("question-answering", model=QA_MODEL)
     except Exception as exc:
-        raise RuntimeError(
-            "Could not load the question-answering model. The first run downloads AI model "
-            "files and can take several minutes. Check your internet connection, then retry."
-        ) from exc
+        print("WARNING: question-answering model load failed; using extractive fallback.")
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        return None
 
 
 def retrieve_article(url):
@@ -125,34 +133,66 @@ def retrieve_article(url):
     return title, text
 
 
+def generate_extractive_summary(article_text, max_sentences=5):
+    sentences = sentence_split(article_text)
+    if not sentences:
+        return ""
+
+    word_counts = Counter(important_words(article_text))
+    scored_sentences = []
+    for index, sentence in enumerate(sentences):
+        words = important_words(sentence)
+        if not words:
+            continue
+        score = sum(word_counts[word] for word in words) / max(len(words), 1)
+        if 60 <= len(sentence) <= 360:
+            score *= 1.2
+        scored_sentences.append((score, index, sentence))
+
+    if not scored_sentences:
+        return " ".join(sentences[:max_sentences])
+
+    best_sentences = sorted(scored_sentences, reverse=True)[:max_sentences]
+    best_sentences = sorted(best_sentences, key=lambda item: item[1])
+    return clean_text(" ".join(sentence for _, _, sentence in best_sentences))
+
+
 def generate_summary(article_text):
     summarizer = get_summarizer()
-    source_chunks = chunk_text(article_text, MAX_SUMMARY_INPUT_CHARS)
-    chunk_summaries = []
+    if summarizer is None:
+        return generate_extractive_summary(article_text)
 
-    for chunk in source_chunks[:4]:
-        max_len = 170 if len(source_chunks) == 1 else 120
-        min_len = 55 if len(chunk) > 900 else 25
-        result = summarizer(
-            chunk,
-            max_length=max_len,
-            min_length=min_len,
-            do_sample=False,
-            truncation=True,
-        )[0]["summary_text"]
-        chunk_summaries.append(clean_text(result))
+    try:
+        source_chunks = chunk_text(article_text, MAX_SUMMARY_INPUT_CHARS)
+        chunk_summaries = []
 
-    summary = " ".join(chunk_summaries)
-    if len(chunk_summaries) > 1:
-        summary = summarizer(
-            summary,
-            max_length=180,
-            min_length=70,
-            do_sample=False,
-            truncation=True,
-        )[0]["summary_text"]
+        for chunk in source_chunks[:4]:
+            max_len = 170 if len(source_chunks) == 1 else 120
+            min_len = 55 if len(chunk) > 900 else 25
+            result = summarizer(
+                chunk,
+                max_length=max_len,
+                min_length=min_len,
+                do_sample=False,
+                truncation=True,
+            )[0]["summary_text"]
+            chunk_summaries.append(clean_text(result))
 
-    return clean_text(summary)
+        summary = " ".join(chunk_summaries)
+        if len(chunk_summaries) > 1:
+            summary = summarizer(
+                summary,
+                max_length=180,
+                min_length=70,
+                do_sample=False,
+                truncation=True,
+            )[0]["summary_text"]
+
+        return clean_text(summary)
+    except Exception as exc:
+        print("WARNING: summarization inference failed; using extractive fallback.")
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        return generate_extractive_summary(article_text)
 
 
 def best_source_sentence(answer, context):
@@ -163,8 +203,33 @@ def best_source_sentence(answer, context):
     return ""
 
 
+def answer_question_extractive(question, context):
+    sentences = sentence_split(context)
+    ranked_sentences = sorted(
+        sentences,
+        key=lambda sentence: keyword_overlap_score(question, sentence),
+        reverse=True,
+    )
+    best_sentence = clean_text(ranked_sentences[0]) if ranked_sentences else ""
+    if not best_sentence or keyword_overlap_score(question, best_sentence) == 0:
+        return {
+            "answer": "I could not find a reliable answer in the article text.",
+            "confidence": 0,
+            "source": "",
+        }
+
+    return {
+        "answer": best_sentence,
+        "confidence": 0.35,
+        "source": best_sentence,
+    }
+
+
 def answer_question(question, context):
     qa_pipeline = get_question_answerer()
+    if qa_pipeline is None:
+        return answer_question_extractive(question, context)
+
     candidates = chunk_text(context, MAX_QA_CONTEXT_CHARS)
     ranked_candidates = sorted(
         candidates,
@@ -174,18 +239,19 @@ def answer_question(question, context):
 
     best_result = None
     best_context = ""
-    for chunk in ranked_candidates:
-        result = qa_pipeline(question=question, context=chunk)
-        if best_result is None or result.get("score", 0) > best_result.get("score", 0):
-            best_result = result
-            best_context = chunk
+    try:
+        for chunk in ranked_candidates:
+            result = qa_pipeline(question=question, context=chunk)
+            if best_result is None or result.get("score", 0) > best_result.get("score", 0):
+                best_result = result
+                best_context = chunk
+    except Exception as exc:
+        print("WARNING: question-answering inference failed; using extractive fallback.")
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        return answer_question_extractive(question, context)
 
     if not best_result or best_result.get("score", 0) < MIN_ANSWER_SCORE or not clean_text(best_result.get("answer")):
-        return {
-            "answer": "I could not find a reliable answer in the article text.",
-            "confidence": best_result.get("score", 0) if best_result else 0,
-            "source": "",
-        }
+        return answer_question_extractive(question, context)
 
     answer = clean_text(best_result["answer"])
     return {
@@ -228,14 +294,12 @@ def analyze():
             "summary": summary,
             "sourceUrl": url,
             "wordCount": len(article_text.split()),
+            "summaryModel": SUMMARY_MODEL,
         })
 
     except ValueError as e:
         print("ERROR:", e)
         return jsonify({"error": str(e)}), 400
-    except RuntimeError as e:
-        print("ERROR:", e)
-        return jsonify({"error": str(e)}), 503
     except Exception as e:
         print("ERROR:", e)
         return jsonify({"error": str(e)}), 500
@@ -258,9 +322,6 @@ def question():
     except ValueError as e:
         print("ERROR:", e)
         return jsonify({"error": str(e)}), 400
-    except RuntimeError as e:
-        print("ERROR:", e)
-        return jsonify({"error": str(e)}), 503
     except Exception as e:
         print("ERROR:", e)
         return jsonify({"error": str(e)}), 500
